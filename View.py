@@ -6,13 +6,14 @@ import logging
 import numpy as np
 import neurokit2 as nk  # only needed if you have a raw ECG waveform
 
-from PySide6.QtCore import QTimer, Qt, QPointF, Slot
+from PySide6.QtCore import QTimer, Qt, QPointF, Slot, QSize, QMargins, QPropertyAnimation, QEasingCurve, Property
 from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QSlider, QLabel,
-    QWidget, QComboBox, QPushButton, QGraphicsDropShadowEffect
+    QWidget, QComboBox, QPushButton, QGraphicsDropShadowEffect,
+    QMainWindow, QGridLayout
 )
 from PySide6.QtCharts import QChartView, QLineSeries, QScatterSeries, QAreaSeries
-from PySide6.QtGui import QPen, QPainter, QColor, QFont
+from PySide6.QtGui import QPen, QPainter, QColor, QFont, QBrush, QIcon, QPainterPath, QMovie
 
 from Model import Model
 from sensor import SensorHandler
@@ -22,11 +23,38 @@ from views.charts import (
     create_line_series, create_spline_series,
     create_axis
 )
-from styles.colours import RED, YELLOW, GREEN, BLUE, GRAY, GOLD, LINEWIDTH, DOTSIZE_SMALL
+from styles.colours import RED, YELLOW, GREEN, BLUE, GRAY, GOLD, PURPLE, DARK_BG, CHART_BG, TEXT_COLOR, LINEWIDTH, DOTSIZE_SMALL
 from styles.utils import get_stylesheet
 
+# Add a HeartWidget for pulsing heart animation
+class HeartWidget(QWidget):
+    """A widget that displays a pulsing heart animation using a GIF."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(150, 150)
+        
+        # Load the GIF animation from file
+        self.movie = QMovie("img/heartbeat-animation.gif")
+        self.movie.setScaledSize(QSize(150, 150))  # Scale to widget size
+        
+        # Start the animation
+        self.movie.start()
+        
+        # Connect frameChanged signal to update the widget
+        self.movie.frameChanged.connect(self.update)
+    
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Draw the current frame of the GIF
+        current_frame = self.movie.currentPixmap()
+        painter.drawPixmap(self.rect(), current_frame)
+        
+        painter.end()
 
-class View(QChartView):
+class View(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.logger = logging.getLogger(__name__)
@@ -37,8 +65,13 @@ class View(QChartView):
         self.sensor_handler = SensorHandler()
         self.sensor_handler.scan_complete.connect(self._on_scan_complete)
 
-        # styling
+        # Apply dark mode
         self.setStyleSheet(get_stylesheet("styles/style.qss"))
+        
+        # Set widget background
+        main_widget = QWidget()
+        main_widget.setStyleSheet(f"background-color: {DARK_BG.name()};")
+        self.setCentralWidget(main_widget)
 
         # update intervals (ms)
         self.UPDATE_SERIES_PERIOD = 100
@@ -53,12 +86,21 @@ class View(QChartView):
         # initial pacer rate
         self.pacer_rate = 6
 
+        # Set minimum window size to ensure charts remain visible
+        self.setMinimumWidth(800)
+        self.setMinimumHeight(600)
+        
+        # Track window state
+        self.compact_mode = False
+        
+        # Register window resizing handler
+        self.resizeEvent = self.handleResize
+
         # build and arrange charts
         self.create_breath_chart()
         self.create_hrv_chart()
         self.create_circles_layout()
         self.create_bpm_chart()
-        self.create_ecg_chart()
         self.set_view_layout()
         self.start_view_update()
 
@@ -78,15 +120,15 @@ class View(QChartView):
         self.axis_breath_x = create_axis(
             None, tickCount=10,
             rangeMin=-self.BREATH_ACC_TIME_RANGE, rangeMax=0,
-            labelSize=10, flip=False
+            labelSize=16, flip=False
         )
         self.axis_breath_y = create_axis(
             "Chest acc (m/s²)", BLUE,
-            rangeMin=-1, rangeMax=1, labelSize=10
+            rangeMin=-1, rangeMax=1, labelSize=16
         )
         self.axis_hr_y = create_axis(
             "HR (bpm)", RED,
-            rangeMin=40, rangeMax=200, labelSize=10
+            rangeMin=40, rangeMax=200, labelSize=16
         )
 
         for s in (self.series_pacer, self.series_breath_acc,
@@ -114,7 +156,7 @@ class View(QChartView):
         self.series_br_marker = create_scatter_series(GRAY, DOTSIZE_SMALL)
         self.series_br_marker.setMarkerShape(QScatterSeries.MarkerShapeTriangle)
         self.axis_br_y = create_axis(
-            "BR (bpm)", BLUE, rangeMin=0, rangeMax=20, labelSize=10
+            "BR (bpm)", BLUE, rangeMin=0, rangeMax=20, labelSize=16
         )
 
         # RMSSD / max-min
@@ -122,10 +164,10 @@ class View(QChartView):
         self.series_maxmin_marker = create_scatter_series(RED, DOTSIZE_SMALL)
         self.axis_hrv_x = create_axis(
             None, tickCount=10,
-            rangeMin=-self.HRV_SERIES_TIME_RANGE, rangeMax=0, labelSize=10
+            rangeMin=-self.HRV_SERIES_TIME_RANGE, rangeMax=0, labelSize=16
         )
         self.axis_hrv_y = create_axis(
-            "HRV (ms)", RED, rangeMin=0, rangeMax=250, labelSize=10
+            "HRV (ms)", RED, rangeMin=0, rangeMax=250, labelSize=16
         )
 
         # HRV bands (store to avoid GC)
@@ -162,13 +204,18 @@ class View(QChartView):
     def create_bpm_chart(self):
         """Live BPM chart."""
         self.chart_bpm = create_chart(title="Heart Rate", showTitle=True)
-        self.series_bpm = create_line_series(RED, LINEWIDTH)
+        
+        # Set the title font to be larger
+        title_font = QFont("Arial", 21, QFont.Bold)  # Increased title font size
+        self.chart_bpm.setTitleFont(title_font)
+        
+        self.series_bpm = create_line_series(PURPLE, LINEWIDTH)
         self.axis_bpm_x = create_axis(
             None, tickCount=10,
-            rangeMin=-self.HRV_SERIES_TIME_RANGE, rangeMax=0, labelSize=10
+            rangeMin=-self.HRV_SERIES_TIME_RANGE, rangeMax=0, labelSize=16
         )
         self.axis_bpm_y = create_axis(
-            "BPM", RED, rangeMin=40, rangeMax=200, labelSize=10
+            "BPM", PURPLE, rangeMin=40, rangeMax=200, labelSize=16
         )
 
         self.chart_bpm.addSeries(self.series_bpm)
@@ -181,147 +228,278 @@ class View(QChartView):
         self.bpm_view.setRenderHint(QPainter.Antialiasing)
         self.bpm_view.setStyleSheet("background-color: transparent;")
 
-        self.bpm_label = self.chart_bpm.scene().addText("BPM: --")
-        self.bpm_label.setFont(QFont("Segoe UI", 10))
-        self.bpm_label.setDefaultTextColor(RED)
-        self.bpm_label.setPos(10, 10)
+        # Create container for BPM text display and heart animation
+        self.bpm_header = QWidget()
+        bpm_header_layout = QHBoxLayout(self.bpm_header)
+        bpm_header_layout.setContentsMargins(5, 15, 5, 5)  # Add top padding
+        bpm_header_layout.setSpacing(10)
+        
+        # Large BPM text display
+        self.bpm_text = QLabel("-- BPM")
+        self.bpm_text.setFont(QFont("Arial", 28, QFont.Bold))  # Increased from 28 to 34
+        self.bpm_text.setStyleSheet(f"color: {PURPLE.name()};")
+        self.bpm_text.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        
+        # Pulsing heart animation
+        self.heart_widget = HeartWidget()
+        
+        # Add widgets to header layout
+        bpm_header_layout.addWidget(self.heart_widget)
+        bpm_header_layout.addWidget(self.bpm_text)
+        bpm_header_layout.addStretch(1)
+        
+        # Create a container for both the header and the chart view
+        self.bpm_container = QWidget()
+        bpm_container_layout = QVBoxLayout(self.bpm_container)
+        bpm_container_layout.setContentsMargins(0, 0, 0, 0)
+        bpm_container_layout.setSpacing(0)
+        
+        # Add header to the top, then the chart below
+        bpm_container_layout.addWidget(self.bpm_header)
+        bpm_container_layout.addWidget(self.bpm_view)
 
     def update_bpm_series(self):
         pts = self.model.hrv_analyser.hr_history.get_qpoint_list()
         self.series_bpm.replace(pts)
         if pts:
             val = int(pts[-1].y())
-            self.bpm_label.setPlainText(f"BPM: {val} bpm")
-
-    def create_ecg_chart(self):
-        """Plot raw ECG samples from ecg_history."""
-        self.chart_ecg = create_chart(title="ECG", showTitle=True)
-        self.series_ecg = create_line_series(BLUE, LINEWIDTH)
-        self.axis_ecg_x = create_axis(
-            None, tickCount=10,
-            rangeMin=-10, rangeMax=0, labelSize=10
-        )
-        self.axis_ecg_y = create_axis(
-            "mV", BLUE, rangeMin=-2000, rangeMax=2000, labelSize=10
-        )
-
-        self.chart_ecg.addSeries(self.series_ecg)
-        self.chart_ecg.addAxis(self.axis_ecg_x, Qt.AlignBottom)
-        self.chart_ecg.addAxis(self.axis_ecg_y, Qt.AlignLeft)
-        self.series_ecg.attachAxis(self.axis_ecg_x)
-        self.series_ecg.attachAxis(self.axis_ecg_y)
-
-        self.ecg_view = QChartView(self.chart_ecg)
-        self.ecg_view.setRenderHint(QPainter.Antialiasing)
-        self.ecg_view.setStyleSheet("background-color: transparent;")
-
-        self.ecg_label = self.chart_ecg.scene().addText("ECG")
-        self.ecg_label.setFont(QFont("Segoe UI", 10))
-        self.ecg_label.setDefaultTextColor(GRAY)
-        self.ecg_label.setPos(10, 10)
-
-    def update_ecg_series(self):
-        pts = self.model.ecg_history.get_qpoint_list()
-        self.series_ecg.replace(pts)
-        if not pts:
-            return
-
-        # auto-scale X axis
-        xs = [p.x() for p in pts]
-        self.axis_ecg_x.setRange(min(xs), max(xs))
-
-        # auto-scale Y axis
-        ys = [p.y() for p in pts]
-        y_min, y_max = min(ys), max(ys)
-        margin = 0.1 * (y_max - y_min or 1)
-        self.axis_ecg_y.setRange(y_min - margin, y_max + margin)
-
-        # — NeuroKit2 processing (uncomment if you have a true ECG waveform) —
-        # values = np.array(ys)
-        # clean = nk.ecg_clean(values, sampling_rate=250)
-        # peaks, info = nk.ecg_peaks(clean, sampling_rate=250)
-        # peak_ids = np.where(peaks["ECG_R_Peaks"])[0]
-        # pts_r = [QPointF(xs[i], clean[i]) for i in peak_ids]
-        # self.series_r_peaks.replace(pts_r)
+            # Update the BPM text at the top of the chart
+            self.bpm_text.setText(f"{val} BPM")
 
     def create_circles_layout(self):
-        self.circles_widget = CirclesWidget(
-            *self.model.pacer.update(self.pacer_rate), GOLD, BLUE, RED
+        """Creates the breathing visualization and controls layout."""
+        self.controlWidget = QWidget()
+        self.controlWidget.setObjectName("controlWidget")
+        self.controlWidget.setMinimumWidth(250)
+        self.controlWidget.setMaximumWidth(300)
+        
+        # Add drop shadow to control widget for depth
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        shadow.setOffset(3, 3)
+        self.controlWidget.setGraphicsEffect(shadow)
+
+        # Create breathing circles widget with modern styling
+        self.circles = CirclesWidget(
+            x_values=self.model.pacer.cos_theta, 
+            y_values=self.model.pacer.sin_theta,
+            pacer_color=PURPLE,       # Use purple for pacer
+            breathing_color=BLUE,     # Use blue for breathing
+            hr_color=RED,             # Use red for heart rate
+            background_image="img/lungs.png"  # Add the lungs background image
         )
-        self.circles_widget.setRenderHint(QPainter.Antialiasing)
-
-        self.pacer_slider = QSlider(Qt.Horizontal)
-        self.pacer_slider.setRange(6, 20)
-        self.pacer_slider.setValue(self.pacer_rate * 2)
-        self.pacer_slider.valueChanged.connect(self.update_pacer_rate)
-
-        self.pacer_label = QLabel(f"{self.pacer_rate}")
-        self.pacer_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        self.pacer_label.setStyleSheet("color: black")
-        self.pacer_label.setFixedWidth(40)
-
-        slider_layout = QHBoxLayout()
-        slider_layout.addWidget(self.pacer_label)
-        slider_layout.addWidget(self.pacer_slider)
-        slider_layout.addSpacing(20)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.circles_widget, alignment=Qt.AlignCenter)
-        layout.addLayout(slider_layout)
-
-        self.circles_layout = SquareWidget()
-        self.circles_layout.setLayout(layout)
+        self.circles.setMinimumSize(200, 200)
+        self.circles.setRenderHint(QPainter.Antialiasing)
+        
+        # Create a widget to hold the breathing visualization
+        self.breathingVisualContainer = QWidget()
+        self.breathingVisualContainer.setMinimumHeight(300)
+        
+        # Create a layout for the circles
+        breathingLayout = QGridLayout(self.breathingVisualContainer)
+        breathingLayout.setContentsMargins(0, 0, 0, 0)
+        
+        # Add circles to the layout
+        breathingLayout.addWidget(self.circles, 0, 0, Qt.AlignCenter)
+        
+        # Style the rate slider for modern appearance
+        self.rate_slider = QSlider(Qt.Horizontal)
+        self.rate_slider.setMinimum(4)
+        self.rate_slider.setMaximum(12)
+        self.rate_slider.setValue(self.pacer_rate)
+        self.rate_slider.setTickPosition(QSlider.TicksBelow)
+        self.rate_slider.setTickInterval(1)
+        self.rate_slider.valueChanged.connect(self.update_pacer_rate)
+        
+        # Modern styled rate label
+        self.rate_label = QLabel(f"Breathing rate: {self.pacer_rate} bpm")
+        self.rate_label.setFont(QFont("Arial", 21))  # Increased from 12 to 16
+        self.rate_label.setAlignment(Qt.AlignCenter)
+        
+        # Add sensor controls section title
+        sensorGroupLabel = QLabel("Sensor Connection")
+        sensorGroupLabel.setFont(QFont("Arial", 21, QFont.Bold))
+        sensorGroupLabel.setAlignment(Qt.AlignCenter)
+        
+        # Create enhanced buttons with icons
+        self.scan_button = QPushButton("  Scan for Devices")
+        self.scan_button.setFont(QFont("Arial", 11))
+        self.scan_button.setIcon(QIcon("img/scan.png"))
+        self.scan_button.setIconSize(QSize(24, 24))
+        self.scan_button.setMinimumHeight(40)
+        self.scan_button.setObjectName("actionButton")
+        self.scan_button.setStyleSheet("""
+            QPushButton#actionButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #D23888, stop:1 #e76c9e);
+                border-radius: 8px;
+                padding: 8px 16px;
+                color: white;
+                text-align: left;
+                border: none;
+            }
+            QPushButton#actionButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #e358a2, stop:1 #f086b5);
+            }
+            QPushButton#actionButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #b22a74, stop:1 #c75689);
+            }
+        """)
+        self.scan_button.clicked.connect(self._on_scan_button_press)
+        
+        # Create device selection dropdown
+        self.sensor_combo = QComboBox()
+        self.sensor_combo.setFont(QFont("Arial", 11))
+        self.sensor_combo.setMinimumHeight(40)
+        self.sensor_combo.setStyleSheet("""
+            QComboBox {
+                border-radius: 8px;
+                padding: 8px 16px;
+                background-color: #2d2d2d;
+                border: 1px solid #333333;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 24px;
+                border-left: 1px solid #333333;
+                border-top-right-radius: 8px;
+                border-bottom-right-radius: 8px;
+            }
+        """)
+        
+        # Connect button styling
+        self.connect_button = QPushButton("  Connect")
+        self.connect_button.setFont(QFont("Arial", 11))
+        self.connect_button.setIcon(QIcon("img/connect.png"))
+        self.connect_button.setIconSize(QSize(24, 24))
+        self.connect_button.setMinimumHeight(40) 
+        self.connect_button.setObjectName("actionButton")
+        self.connect_button.setStyleSheet("""
+            QPushButton#actionButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #D23888, stop:1 #e76c9e);
+                border-radius: 8px;
+                padding: 8px 16px;
+                color: white;
+                text-align: left;
+                border: none;
+            }
+            QPushButton#actionButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #e358a2, stop:1 #f086b5);
+            }
+            QPushButton#actionButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #b22a74, stop:1 #c75689);
+            }
+            QPushButton#actionButton:disabled {
+                background: #444444;
+                color: #888888;
+            }
+        """)
+        self.connect_button.clicked.connect(self._on_connect_button_press)
+        self.connect_button.setEnabled(False)
+        
+        # Layout setup with proper spacing for a modern look
+        controlLayout = QVBoxLayout()
+        controlLayout.setContentsMargins(15, 15, 15, 15)
+        controlLayout.setSpacing(15)
+        
+        # Add title label for the control panel
+        title_label = QLabel("Breathing Control")
+        title_label.setFont(QFont("Arial", 21, QFont.Bold))  # Increased from 14 to 18
+        title_label.setAlignment(Qt.AlignCenter)
+        controlLayout.addWidget(title_label)
+        
+        # Add circles widget
+        circleContainer = QWidget()
+        circleContainer.setMinimumHeight(300) # Ensure enough space
+        circleLayout = QVBoxLayout(circleContainer)
+        circleLayout.setContentsMargins(0, 10, 0, 10)
+        circleLayout.setAlignment(Qt.AlignCenter) # Center alignment for the layout
+        circleLayout.addWidget(self.breathingVisualContainer, 0, Qt.AlignCenter)
+        self.circles.setMinimumSize(240, 240)  # Increase size for better visibility
+        controlLayout.addWidget(circleContainer, 0, Qt.AlignCenter) # Center the container in parent layout
+        
+        # Add rate control
+        controlLayout.addWidget(self.rate_label)
+        controlLayout.addWidget(self.rate_slider)
+        
+        # Add spacer before sensor controls
+        controlLayout.addSpacing(10)
+        
+        # Add sensor controls section
+        controlLayout.addWidget(sensorGroupLabel)
+        
+        # Add connection details indicator
+        self.connection_status = QLabel("Not Connected")
+        self.connection_status.setFont(QFont("Arial", 18))
+        self.connection_status.setAlignment(Qt.AlignCenter)
+        self.connection_status.setStyleSheet("color: #ef4444;")
+        controlLayout.addWidget(self.connection_status)
+        
+        # Sensor controls layout
+        controlLayout.addWidget(self.scan_button)
+        controlLayout.addWidget(self.sensor_combo)
+        controlLayout.addWidget(self.connect_button)
+        
+        # Add spacer at the bottom
+        controlLayout.addStretch()
+        
+        self.controlWidget.setLayout(controlLayout)
 
     def set_view_layout(self):
+        """
+        Layout structure:
+        - Top section:
+            - Control panel (left)
+            - Heart Rate (right)
+        - Bottom section:
+            - Breath (left)
+            - HRV (right)
+        """
         main_layout = QVBoxLayout()
-        graph_layout = QVBoxLayout()
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+        self.centralWidget().setLayout(main_layout)
 
-        acc_v = QChartView(self.chart_breath)
-        acc_v.setRenderHint(QPainter.Antialiasing)
-        acc_v.setStyleSheet("background-color: transparent;")
-        hrv_v = QChartView(self.chart_hrv)
-        hrv_v.setRenderHint(QPainter.Antialiasing)
-        hrv_v.setStyleSheet("background-color: transparent;")
+        # Top section: Control panel (left) and Heart Rate (right)
+        topSectionWidget = QWidget()
+        topSectionLayout = QHBoxLayout(topSectionWidget)
+        topSectionLayout.setContentsMargins(0, 0, 0, 0)
+        topSectionLayout.setSpacing(10)
 
-        top_row = QHBoxLayout()
-        top_row.addWidget(self.circles_layout, stretch=1)
-        top_row.addWidget(acc_v, stretch=3)
+        # Left side of top section - Control Panel
+        topSectionLayout.addWidget(self.controlWidget, 1)
 
-        graph_layout.addLayout(top_row, stretch=1)
-        graph_layout.addWidget(hrv_v, stretch=1)
-        graph_layout.addWidget(self.bpm_view, stretch=1)
-        graph_layout.addWidget(self.ecg_view, stretch=1)
-        graph_layout.setContentsMargins(0,0,0,0)
+        # Right side of top section - Heart Rate chart
+        topSectionLayout.addWidget(self.bpm_container, 2)
 
-        self.message_box = QLabel("Scanning...")
-        self.message_box.setFixedSize(150,15)
-        self.scan_button = QPushButton("Scan")
-        self.scan_button.clicked.connect(self._on_scan_button_press)
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(10)
-        shadow.setOffset(20,20)
-        shadow.setColor(QColor(255,255,255,255))
-        self.scan_button.setGraphicsEffect(shadow)
+        # Bottom section: Breath (left) and HRV (right) charts
+        bottomSectionWidget = QWidget()
+        bottomSectionLayout = QHBoxLayout(bottomSectionWidget)
+        bottomSectionLayout.setContentsMargins(0, 0, 0, 0)
+        bottomSectionLayout.setSpacing(10)
 
-        self.device_menu = QComboBox()
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.clicked.connect(self._on_connect_button_press)
+        # Create chart views if they don't exist
+        if not hasattr(self, 'breathView'):
+            self.breathView = QChartView(self.chart_breath)
+            self.breathView.setRenderHint(QPainter.Antialiasing)
+            self.breathView.setStyleSheet("background-color: transparent;")
+            
+        if not hasattr(self, 'hrvView'):
+            self.hrvView = QChartView(self.chart_hrv)
+            self.hrvView.setRenderHint(QPainter.Antialiasing)
+            self.hrvView.setStyleSheet("background-color: transparent;")
 
-        ctrl = QHBoxLayout()
-        ctrl.addStretch(1)
-        ctrl.addWidget(self.message_box)
-        ctrl.addWidget(self.scan_button)
-        ctrl.addWidget(self.device_menu)
-        ctrl.addWidget(self.connect_button)
-        ctrl.addStretch(1)
+        # Add Breath and HRV charts to bottom section
+        bottomSectionLayout.addWidget(self.breathView, 1)
+        bottomSectionLayout.addWidget(self.hrvView, 1)
 
-        ctrl_widget = QWidget()
-        ctrl_widget.setObjectName("controlWidget")
-        ctrl_widget.setLayout(ctrl)
-
-        main_layout.addLayout(graph_layout, stretch=10)
-        main_layout.addWidget(ctrl_widget, stretch=1)
-        self.setLayout(main_layout)
+        # Add the two main sections to the main layout
+        main_layout.addWidget(topSectionWidget, 1)
+        main_layout.addWidget(bottomSectionWidget, 1)
+        
+        # Make sure the circles background is updated
+        QTimer.singleShot(100, self.update_circles_background)
 
     def start_view_update(self):
         self.update_series_timer = QTimer()
@@ -340,17 +518,13 @@ class View(QChartView):
         self.bpm_timer.timeout.connect(self.update_bpm_series)
         self.bpm_timer.start(self.UPDATE_SERIES_PERIOD)
 
-        self.ecg_timer = QTimer()
-        self.ecg_timer.timeout.connect(self.update_ecg_series)
-        self.ecg_timer.start(self.UPDATE_SERIES_PERIOD)
-
     def update_pacer_rate(self):
-        self.pacer_rate = self.pacer_slider.value() / 2
-        self.pacer_label.setText(f"{self.pacer_rate}")
+        self.pacer_rate = self.rate_slider.value()
+        self.rate_label.setText(f"Breathing rate: {self.pacer_rate} bpm")
 
     def plot_circles(self):
         coords = self.model.pacer.update(self.pacer_rate)
-        self.circles_widget.update_pacer_series(*coords)
+        self.circles.update_pacer_series(*coords)
 
         self.pacer_values_hist = np.roll(self.pacer_values_hist, -1)
         self.pacer_values_hist[-1] = np.linalg.norm([coords[0][0], coords[1][0]]) - 0.5
@@ -358,7 +532,7 @@ class View(QChartView):
         self.pacer_times_hist[-1] = time.time_ns() / 1e9
 
         breath_coords = self.model.breath_analyser.get_breath_circle_coords()
-        self.circles_widget.update_breath_series(*breath_coords)
+        self.circles.update_breath_series(*breath_coords)
 
     def update_acc_series(self):
         self.pacer_times_hist_rel_s = self.pacer_times_hist - time.time_ns() / 1e9
@@ -393,22 +567,20 @@ class View(QChartView):
 
     @Slot()
     def _on_scan_button_press(self):
-        self.message_box.setText("Scanning...")
         asyncio.create_task(self.sensor_handler.scan())
 
     @Slot()
     def _on_scan_complete(self):
-        self.message_box.setText("Select a sensor")
-        self.device_menu.clear()
-        self.device_menu.addItems(self.sensor_handler.get_valid_device_names())
+        device_names = self.sensor_handler.get_valid_device_names()
+        self.sensor_combo.clear()
+        self.sensor_combo.addItems(device_names)
+        self.connect_button.setEnabled(len(device_names) > 0)
 
     @Slot()
     def _on_connect_button_press(self):
-        self.message_box.setText("Connecting...")
-        name = self.device_menu.currentText()
-        if name:
-            sensor = self.sensor_handler.create_sensor_client(name)
-            asyncio.create_task(self.set_sensor(sensor))
+        selected_device = self.sensor_combo.currentText()
+        sensor = self.sensor_handler.create_sensor_client(selected_device)
+        asyncio.create_task(self.set_sensor(sensor))
 
     async def set_sensor(self, sensor):
         try:
@@ -422,4 +594,63 @@ class View(QChartView):
 
     @Slot()
     def _on_sensor_connected(self):
-        self.message_box.setText("Connected")
+        self.connection_status.setText("Connected")
+        self.connection_status.setStyleSheet("color: #10b981;")
+
+    def handleResize(self, event):
+        """Handle window resize events to adjust layout as needed."""
+        width = event.size().width()
+        
+        # Check if we should switch to compact mode (width < 1000px)
+        new_compact_mode = width < 1000
+        
+        # Only update if the mode changed
+        if new_compact_mode != self.compact_mode:
+            self.compact_mode = new_compact_mode
+            
+            # Adjust control panel width based on window size
+            if self.compact_mode:
+                self.controlWidget.setMaximumWidth(220)
+            else:
+                self.controlWidget.setMaximumWidth(300)
+            
+            # Auto-adjust chart axes for better display in compact mode
+            self._update_chart_for_compact_mode()
+        
+        # Pass event to parent class
+        super().resizeEvent(event)
+    
+    def _update_chart_for_compact_mode(self):
+        """Adjust chart properties for compact mode."""
+        # Breathing chart
+        if self.compact_mode:
+            self.axis_breath_x.setTickCount(4)
+            self.axis_breath_y.setTickCount(4)
+            self.axis_hr_y.setTickCount(4)
+        else:
+            self.axis_breath_x.setTickCount(6)
+            self.axis_breath_y.setTickCount(6)
+            self.axis_hr_y.setTickCount(6)
+        
+        # HRV chart
+        if self.compact_mode:
+            self.axis_hrv_x.setTickCount(4)
+            self.axis_hrv_y.setTickCount(4)
+            self.axis_br_y.setTickCount(4)
+        else:
+            self.axis_hrv_x.setTickCount(6)
+            self.axis_hrv_y.setTickCount(6)
+            self.axis_br_y.setTickCount(6)
+        
+        # BPM chart
+        if self.compact_mode:
+            self.axis_bpm_x.setTickCount(4)
+            self.axis_bpm_y.setTickCount(4)
+        else:
+            self.axis_bpm_x.setTickCount(6)
+            self.axis_bpm_y.setTickCount(6)
+
+    def update_circles_background(self):
+        """Force update of the circles background image"""
+        if hasattr(self, 'circles'):
+            self.circles.apply_background_image_to_chart()
